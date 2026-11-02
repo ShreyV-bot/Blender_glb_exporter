@@ -1,0 +1,248 @@
+import bpy
+import bmesh
+import os
+import numpy as np
+
+def export_single_self_contained_temple_glb():
+    # --------------------------------------------------------------------------
+    # 1. TARGET FILE PATH (Single File Only)
+    # --------------------------------------------------------------------------
+    EXPORT_DIR   = r"C:" #change path accordinly
+    GLB_FILEPATH = os.path.join(EXPORT_DIR, "Temple_1.glb")
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+
+    if bpy.context.object and bpy.context.object.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+    # Save backup of current .blend file before destructive scene prep
+    if bpy.data.is_saved:
+        bpy.ops.wm.save_as_mainfile(filepath=bpy.data.filepath)
+
+    # --------------------------------------------------------------------------
+    # 2. UNHIDE & ENABLE ALL COLLECTIONS, MESHES, AND LIGHTS
+    # --------------------------------------------------------------------------
+    def enable_layer_collections(layer_col):
+        layer_col.exclude = False
+        layer_col.hide_viewport = False
+        for child in layer_col.children:
+            enable_layer_collections(child)
+
+    enable_layer_collections(bpy.context.view_layer.layer_collection)
+
+    for col in bpy.data.collections:
+        col.hide_viewport = False
+        col.hide_render = False
+
+    for obj in bpy.data.objects:
+        obj.hide_set(False)
+        obj.hide_viewport = False
+        obj.hide_render = False
+
+    bpy.context.view_layer.update()
+
+    # --------------------------------------------------------------------------
+    # 3. REALIZE COLLECTION INSTANCES (Pillars, Arches, Domes)
+    # --------------------------------------------------------------------------
+    instance_empties = [
+        o for o in bpy.data.objects
+        if o.type == 'EMPTY' and o.instance_type == 'COLLECTION' and o.instance_collection is not None
+    ]
+    if instance_empties:
+        bpy.ops.object.select_all(action='DESELECT')
+        for o in instance_empties:
+            o.select_set(True)
+        bpy.context.view_layer.objects.active = instance_empties[0]
+        try:
+            bpy.ops.object.duplicates_make_real(use_base_parent=True, use_hierarchy=True)
+        except Exception as e:
+            print(f"[Instances] Note: {e}")
+
+    bpy.context.view_layer.update()
+
+    # --------------------------------------------------------------------------
+    # 4. CONVERT CURVES, SURFACES, & 3D TEXTS TO MESHES & CLEAN BOOLEAN CUTTERS
+    # --------------------------------------------------------------------------
+    for obj in list(bpy.data.objects):
+        if obj.type == 'MESH' and (obj.display_type in {'WIRE', 'BOUNDS'} or "cut" in obj.name.lower()):
+            if obj.hide_render or obj.display_type in {'WIRE', 'BOUNDS'}:
+                bpy.data.objects.remove(obj, do_unlink=True)
+
+    dg = bpy.context.evaluated_depsgraph_get()
+    for old_obj in [o for o in list(bpy.data.objects) if o.type in {'FONT', 'CURVE', 'SURFACE', 'META'}]:
+        try:
+            eval_obj = old_obj.evaluated_get(dg)
+            new_mesh = bpy.data.meshes.new_from_object(eval_obj)
+            if new_mesh and len(new_mesh.vertices) > 0:
+                orig_name = old_obj.name
+                orig_cols = list(old_obj.users_collection)
+                orig_parent = old_obj.parent
+                orig_mw = old_obj.matrix_world.copy()
+                orig_anim = old_obj.animation_data.action if old_obj.animation_data else None
+                children = [c for c in bpy.data.objects if c.parent == old_obj]
+
+                old_obj.name = f"{orig_name}__old"
+                new_obj = bpy.data.objects.new(orig_name, new_mesh)
+                for c in orig_cols:
+                    c.objects.link(new_obj)
+
+                new_obj.parent = orig_parent
+                new_obj.matrix_world = orig_mw
+                if orig_anim:
+                    new_obj.animation_data_create()
+                    new_obj.animation_data.action = orig_anim
+
+                for ch in children:
+                    ch_mw = ch.matrix_world.copy()
+                    ch.parent = new_obj
+                    ch.matrix_world = ch_mw
+
+                bpy.data.objects.remove(old_obj, do_unlink=True)
+            else:
+                bpy.data.objects.remove(old_obj, do_unlink=True)
+        except Exception as e:
+            print(f"[Convert] Skipped {old_obj.name}: {e}")
+
+    bpy.context.view_layer.update()
+
+    # --------------------------------------------------------------------------
+    # 5. CONVERT 'AREA' LIGHTS TO 'POINT' LIGHTS SO GLTF EXPORTS THEM IN-BUILT
+    #    (glTF 2.0 KHR_lights_punctual only supports POINT, SPOT, and SUN lights;
+    #     Blender's exporter silently drops AREA lights unless converted!)
+    # --------------------------------------------------------------------------
+    for obj in bpy.data.objects:
+        if obj.type == 'LIGHT' and obj.data:
+            if obj.data.type == 'AREA':
+                obj.data.type = 'POINT'
+
+    # --------------------------------------------------------------------------
+    # 6. ENSURE UVs & PACK ALL TEXTURES IN MEMORY FOR EMBEDDING IN THE .GLB
+    # --------------------------------------------------------------------------
+    for obj in bpy.data.objects:
+        if obj.type == 'MESH' and obj.data and len(obj.data.vertices) > 0:
+            if len(obj.data.uv_layers) == 0:
+                bm = bmesh.new()
+                bm.from_mesh(obj.data)
+                uv_layer = bm.loops.layers.uv.verify()
+                for f in bm.faces:
+                    n = f.normal
+                    ax, ay, az = abs(n.x), abs(n.y), abs(n.z)
+                    for loop in f.loops:
+                        co = loop.vert.co
+                        if az >= ax and az >= ay:
+                            loop[uv_layer].uv = (co.x, co.y)
+                        elif ax >= ay and ax >= az:
+                            loop[uv_layer].uv = (co.y, co.z)
+                        else:
+                            loop[uv_layer].uv = (co.x, co.z)
+                bm.to_mesh(obj.data)
+                bm.free()
+
+    def bake_procedural_colorramp_to_packed_image(mat_name, c0, c1):
+        img_name = f"Embedded_{mat_name}_Tex"
+        if img_name in bpy.data.images:
+            return bpy.data.images[img_name]
+
+        res = 512
+        yy, xx = np.mgrid[0:res, 0:res].astype(np.float32) / res
+        wave = (
+            0.5 * np.sin((xx * 6.0 + yy * 4.0) + 1.8 * np.sin(xx * 12.0 - yy * 9.0)) +
+            0.5 * np.cos((xx * 15.0 - yy * 11.0) + 1.2 * np.cos(xx * 23.0 + yy * 19.0))
+        )
+        t = np.clip((wave + 1.0) * 0.5, 0.0, 1.0) ** 1.5
+
+        px = np.ones((res, res, 4), dtype=np.float32)
+        px[:, :, 0] = c0[0] * (1.0 - t) + c1[0] * t
+        px[:, :, 1] = c0[1] * (1.0 - t) + c1[1] * t
+        px[:, :, 2] = c0[2] * (1.0 - t) + c1[2] * t
+
+        img = bpy.data.images.new(img_name, width=res, height=res, alpha=False)
+        img.colorspace_settings.name = 'sRGB'
+        img.pixels.foreach_set(px.ravel())
+        img.pack()
+        return img
+
+    for mat in bpy.data.materials:
+        if not mat.use_nodes or not mat.node_tree:
+            continue
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+        bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+        if not bsdf:
+            continue
+
+        base_in = bsdf.inputs.get("Base Color")
+        if base_in and base_in.is_linked:
+            from_node = base_in.links[0].from_node
+            if from_node.type == 'VALTORGB':
+                elems = from_node.color_ramp.elements
+                c0 = elems[0].color if len(elems) > 0 else (0.92, 0.90, 0.86, 1.0)
+                c1 = elems[-1].color if len(elems) > 1 else (0.72, 0.65, 0.58, 1.0)
+                baked_img = bake_procedural_colorramp_to_packed_image(mat.name, c0, c1)
+                links.remove(base_in.links[0])
+                tex_node = nodes.new('ShaderNodeTexImage')
+                tex_node.image = baked_img
+                links.new(tex_node.outputs["Color"], base_in)
+            elif from_node.type not in {'TEX_IMAGE', 'ATTRIBUTE', 'VERTEX_COLOR'}:
+                links.remove(base_in.links[0])
+
+        for sock_name in ["Roughness", "Metallic"]:
+            sock = bsdf.inputs.get(sock_name)
+            if sock and sock.is_linked and sock.links[0].from_node.type != 'TEX_IMAGE':
+                links.remove(sock.links[0])
+
+        norm_in = bsdf.inputs.get("Normal")
+        if norm_in and norm_in.is_linked:
+            n_node = norm_in.links[0].from_node
+            if n_node.type == 'BUMP':
+                h_in = n_node.inputs.get("Height")
+                if not h_in or not h_in.is_linked or h_in.links[0].from_node.type != 'TEX_IMAGE':
+                    links.remove(norm_in.links[0])
+            elif n_node.type == 'NORMAL_MAP':
+                c_in = n_node.inputs.get("Color")
+                if not c_in or not c_in.is_linked or c_in.links[0].from_node.type != 'TEX_IMAGE':
+                    links.remove(norm_in.links[0])
+
+        for heavy_input in ["Coat Weight", "Clearcoat", "Sheen Weight", "Sheen", "Subsurface Weight", "Subsurface"]:
+            if heavy_input in bsdf.inputs:
+                if bsdf.inputs[heavy_input].is_linked:
+                    links.remove(bsdf.inputs[heavy_input].links[0])
+                bsdf.inputs[heavy_input].default_value = 0.0
+
+    # Pack all external images into memory so the GLB binary embeds every single one
+    for img in list(bpy.data.images):
+        if img.name in {'Render Result', 'Viewer Node'} or img.size[0] == 0 or img.size[1] == 0:
+            continue
+        try:
+            if not img.packed_file:
+                img.pack()
+        except Exception as e:
+            print(f"[Pack] Could not pack {img.name}: {e}")
+
+    # --------------------------------------------------------------------------
+    # 7. EXPORT SINGLE ALL-IN-ONE "Temple_1.glb" (Textures + Lights + Modifiers)
+    # --------------------------------------------------------------------------
+    valid_props = set(bpy.ops.export_scene.gltf.get_rna_type().properties.keys())
+
+    export_kwargs = {
+        "filepath": GLB_FILEPATH,
+        "export_format": 'GLB',         # Packs geometry, textures, animations & lights into 1 binary .glb
+        "use_selection": False,
+        "export_apply": True,           # Applies all modifiers onto the exported meshes
+        "export_yup": True,             # Standard Three.js Y-Up axis
+        "export_texcoords": True,
+        "export_normals": True,
+        "export_materials": 'EXPORT',   # Embeds all materials & packed textures inside Temple_1.glb
+        "export_image_format": 'AUTO',  # Keeps PNG/JPEG textures embedded inside the GLB binary
+        "export_animations": True,
+        "export_lights": True,          # Embeds all lights inside Temple_1.glb via KHR_lights_punctual
+        "export_cameras": True,
+    }
+    filtered_kwargs = {k: v for k, v in export_kwargs.items() if k in valid_props}
+    bpy.ops.export_scene.gltf(**filtered_kwargs)
+
+    print("=" * 75)
+    print(f"SUCCESS! Exported single all-in-one GLB with inbuilt textures & lights:")
+    print(f" -> {GLB_FILEPATH}")
+    print("=" * 75)
+
+export_single_self_contained_temple_glb()
